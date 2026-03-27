@@ -111,20 +111,7 @@ Loss:
 | Dice | 0.7582 | 0.7639 |
 | Accuracy | 0.8725 | 0.8729 |
 
----
-📊 Final Results
-
--Metric           | Value
--Train Loss       | 0.3452
--Val Loss         | 0.4107
--Train IoU        | 0.6280
--Val IoU          | 0.5895
--Train Dice       | 0.7582
--Val Dice         | 0.7639
--Train Accuracy   | 0.8725
--Val Accuracy     | 0.8729
-
----
+ 
 
 🏆 Best Results
 
