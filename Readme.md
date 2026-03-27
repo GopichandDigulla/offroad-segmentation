@@ -9,12 +9,16 @@ We performed three training experiments to progressively improve performance.
 
 Segment offroad terrain into 10 classes such as:
 
+-background
 - Trees 🌳
-- Bushes 🌿
-- Grass 🌾
+- Lush Bushes 🌿
+- Dry Grass 🌾
+- Dry Bushes
+- Ground Clutter
+- Logs
 - Rocks 🪨
+- Landscape
 - Sky ☁️
-- Ground clutter
 
 ---
 
@@ -39,6 +43,14 @@ Result:
 - Low IoU
 - Slow convergence
 
+## Train 1 – Baseline
+
+| Metric | Train | Validation |
+|--------|-------|-----------|
+| Loss | - | - |
+| IoU | 0.50 | 0.48 |
+| Dice | - | - |
+| Accuracy | - | - |
 ---
 
 🔹 Run 2 — Improved Setup
@@ -64,6 +76,15 @@ Result:
 
 ---
 
+## Train 2 – Improved
+
+| Metric | Train | Validation |
+|--------|-------|-----------|
+| Loss | - | - |
+| IoU | 0.57 | 0.56 |
+| Dice | - | - |
+| Accuracy | - | - |
+
 🔹 Run 3 — SegFormer-B3 (Final)
 
 Configuration:
@@ -79,6 +100,15 @@ Loss:
 - CrossEntropy + Dice Loss
 
 ---
+
+## Train 3 – SegFormer
+
+| Metric | Train | Validation |
+|--------|-------|-----------|
+| Loss | 0.3452 | 0.4107 |
+| IoU | 0.6280 | 0.5895 |
+| Dice | 0.7582 | 0.7639 |
+| Accuracy | 0.8725 | 0.8729 |
 
 📊 Final Results
 
@@ -102,6 +132,14 @@ Loss:
 - Lowest Val Loss: 0.4105
 
 ---
+## Best Results
+
+| Metric | Value | Epoch |
+|--------|-------|-------|
+| Best Val IoU | 0.5899 | 8 |
+| Best Val Dice | 0.7640 | 8 |
+| Best Val Accuracy | 0.8735 | 8 |
+| Lowest Val Loss | 0.4105 | 9 |
 
 📈 Key Insights
 
