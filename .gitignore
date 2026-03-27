@@ -1,0 +1,11 @@
+# Dataset
+Offroad_Segmentation_Training_Dataset/
+Offroad_Segmentation_testImages/
+
+# Models
+*.pth
+*.pt
+
+# Cache
+__pycache__/
+*.pyc

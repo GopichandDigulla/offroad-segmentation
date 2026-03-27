@@ -1,0 +1,545 @@
+"""
+SegFormer-B3 Training Script
+Fine-tunes SegFormer-B3 for offroad terrain segmentation
+"""
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from torch import nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import torch.optim as optim
+import torchvision.transforms as transforms
+from PIL import Image
+import cv2
+import os
+from tqdm import tqdm
+from transformers import SegformerForSemanticSegmentation
+
+# Set matplotlib to non-interactive backend
+plt.switch_backend('Agg')
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def save_image(img, filename):
+    """Save an image tensor to file after denormalizing."""
+    img = np.array(img)
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    img = np.moveaxis(img, 0, -1)
+    img = (img * std + mean) * 255
+    cv2.imwrite(filename, img[:, :, ::-1])
+
+
+# ============================================================================
+# Mask Conversion
+# ============================================================================
+
+# Mapping from raw pixel values to new class IDs
+value_map = {
+    0: 0,        # background
+    100: 1,      # Trees
+    200: 2,      # Lush Bushes
+    300: 3,      # Dry Grass
+    500: 4,      # Dry Bushes
+    550: 5,      # Ground Clutter
+    700: 6,      # Logs
+    800: 7,      # Rocks
+    7100: 8,     # Landscape
+    10000: 9     # Sky
+}
+n_classes = len(value_map)
+
+
+def convert_mask(mask):
+    """Convert raw mask values to class IDs."""
+    arr = np.array(mask)
+    new_arr = np.zeros_like(arr, dtype=np.uint8)
+    for raw_value, new_value in value_map.items():
+        new_arr[arr == raw_value] = new_value
+    return Image.fromarray(new_arr)
+
+
+# ============================================================================
+# Dataset
+# ============================================================================
+
+class MaskDataset(Dataset):
+    def __init__(self, data_dir, img_size=512):
+        self.image_dir = os.path.join(data_dir, 'Color_Images')
+        self.masks_dir = os.path.join(data_dir, 'Segmentation')
+        self.data_ids = sorted(os.listdir(self.image_dir))
+        self.img_size = img_size
+        self.img_transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.data_ids)
+
+    def __getitem__(self, idx):
+        data_id = self.data_ids[idx]
+        img_path = os.path.join(self.image_dir, data_id)
+        mask_path = os.path.join(self.masks_dir, data_id)
+
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path)
+        mask = convert_mask(mask)
+
+        image = self.img_transform(image)
+        mask = mask.resize((self.img_size, self.img_size), Image.NEAREST)
+        mask = torch.from_numpy(np.array(mask)).long()
+
+        return image, mask
+
+
+# ============================================================================
+# Metrics
+# ============================================================================
+
+def compute_iou(pred, target, num_classes=10, ignore_index=255):
+    """Compute IoU for each class and return mean IoU."""
+    pred = torch.argmax(pred, dim=1)
+    pred, target = pred.view(-1), target.view(-1)
+
+    iou_per_class = []
+    for class_id in range(num_classes):
+        if class_id == ignore_index:
+            continue
+
+        pred_inds = pred == class_id
+        target_inds = target == class_id
+
+        intersection = (pred_inds & target_inds).sum().float()
+        union = (pred_inds | target_inds).sum().float()
+
+        if union == 0:
+            iou_per_class.append(float('nan'))
+        else:
+            iou_per_class.append((intersection / union).cpu().numpy())
+
+    return np.nanmean(iou_per_class)
+
+
+def compute_dice(pred, target, num_classes=10, smooth=1e-6):
+    """Compute Dice coefficient (F1 Score) per class and return mean Dice Score."""
+    pred = torch.argmax(pred, dim=1)
+    pred, target = pred.view(-1), target.view(-1)
+
+    dice_per_class = []
+    for class_id in range(num_classes):
+        pred_inds = pred == class_id
+        target_inds = target == class_id
+
+        intersection = (pred_inds & target_inds).sum().float()
+        dice_score = (2. * intersection + smooth) / (pred_inds.sum().float() + target_inds.sum().float() + smooth)
+
+        dice_per_class.append(dice_score.cpu().numpy())
+
+    return np.mean(dice_per_class)
+
+
+def compute_pixel_accuracy(pred, target):
+    """Compute pixel accuracy."""
+    pred_classes = torch.argmax(pred, dim=1)
+    return (pred_classes == target).float().mean().cpu().numpy()
+
+
+def evaluate_metrics(model, data_loader, device, img_size, num_classes=10, show_progress=True):
+    """Evaluate all metrics on a dataset."""
+    iou_scores = []
+    dice_scores = []
+    pixel_accuracies = []
+
+    model.eval()
+    loader = tqdm(data_loader, desc="Evaluating", leave=False, unit="batch") if show_progress else data_loader
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+
+            outputs = model(pixel_values=imgs)
+            logits = outputs.logits
+            upsampled = F.interpolate(logits, size=(img_size, img_size), mode="bilinear", align_corners=False)
+
+            iou = compute_iou(upsampled, labels, num_classes=num_classes)
+            dice = compute_dice(upsampled, labels, num_classes=num_classes)
+            pixel_acc = compute_pixel_accuracy(upsampled, labels)
+
+            iou_scores.append(iou)
+            dice_scores.append(dice)
+            pixel_accuracies.append(pixel_acc)
+
+    model.train()
+    return np.mean(iou_scores), np.mean(dice_scores), np.mean(pixel_accuracies)
+
+
+# ============================================================================
+# Plotting Functions
+# ============================================================================
+
+def save_training_plots(history, output_dir):
+    """Save all training metric plots to files."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Plot 1: Loss curves
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='train')
+    plt.plot(history['val_loss'], label='val')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_pixel_acc'], label='train')
+    plt.plot(history['val_pixel_acc'], label='val')
+    plt.title('Pixel Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_curves.png'))
+    plt.close()
+    print(f"Saved training curves to '{output_dir}/training_curves.png'")
+
+    # Plot 2: IoU curves
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_iou'], label='Train IoU')
+    plt.title('Train IoU vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['val_iou'], label='Val IoU')
+    plt.title('Validation IoU vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'iou_curves.png'))
+    plt.close()
+    print(f"Saved IoU curves to '{output_dir}/iou_curves.png'")
+
+    # Plot 3: Dice curves
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_dice'], label='Train Dice')
+    plt.title('Train Dice vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['val_dice'], label='Val Dice')
+    plt.title('Validation Dice vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'dice_curves.png'))
+    plt.close()
+    print(f"Saved Dice curves to '{output_dir}/dice_curves.png'")
+
+    # Plot 4: Combined metrics plot
+    plt.figure(figsize=(12, 10))
+
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_loss'], label='train')
+    plt.plot(history['val_loss'], label='val')
+    plt.title('Loss vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_iou'], label='train')
+    plt.plot(history['val_iou'], label='val')
+    plt.title('IoU vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(2, 2, 3)
+    plt.plot(history['train_dice'], label='train')
+    plt.plot(history['val_dice'], label='val')
+    plt.title('Dice Score vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Dice Score')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(2, 2, 4)
+    plt.plot(history['train_pixel_acc'], label='train')
+    plt.plot(history['val_pixel_acc'], label='val')
+    plt.title('Pixel Accuracy vs Epoch')
+    plt.xlabel('Epoch')
+    plt.ylabel('Pixel Accuracy')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'all_metrics_curves.png'))
+    plt.close()
+    print(f"Saved combined metrics curves to '{output_dir}/all_metrics_curves.png'")
+
+
+def save_history_to_file(history, output_dir):
+    """Save training history to a text file."""
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, 'evaluation_metrics.txt')
+
+    with open(filepath, 'w') as f:
+        f.write("TRAINING RESULTS\n")
+        f.write("=" * 50 + "\n\n")
+
+        f.write("Final Metrics:\n")
+        f.write(f"  Final Train Loss:     {history['train_loss'][-1]:.4f}\n")
+        f.write(f"  Final Val Loss:       {history['val_loss'][-1]:.4f}\n")
+        f.write(f"  Final Train IoU:      {history['train_iou'][-1]:.4f}\n")
+        f.write(f"  Final Val IoU:        {history['val_iou'][-1]:.4f}\n")
+        f.write(f"  Final Train Dice:     {history['train_dice'][-1]:.4f}\n")
+        f.write(f"  Final Val Dice:       {history['val_dice'][-1]:.4f}\n")
+        f.write(f"  Final Train Accuracy: {history['train_pixel_acc'][-1]:.4f}\n")
+        f.write(f"  Final Val Accuracy:   {history['val_pixel_acc'][-1]:.4f}\n")
+        f.write("=" * 50 + "\n\n")
+
+        f.write("Best Results:\n")
+        f.write(f"  Best Val IoU:      {max(history['val_iou']):.4f} (Epoch {np.argmax(history['val_iou']) + 1})\n")
+        f.write(f"  Best Val Dice:     {max(history['val_dice']):.4f} (Epoch {np.argmax(history['val_dice']) + 1})\n")
+        f.write(f"  Best Val Accuracy: {max(history['val_pixel_acc']):.4f} (Epoch {np.argmax(history['val_pixel_acc']) + 1})\n")
+        f.write(f"  Lowest Val Loss:   {min(history['val_loss']):.4f} (Epoch {np.argmin(history['val_loss']) + 1})\n")
+        f.write("=" * 50 + "\n\n")
+
+        f.write("Per-Epoch History:\n")
+        f.write("-" * 100 + "\n")
+        headers = ['Epoch', 'Train Loss', 'Val Loss', 'Train IoU', 'Val IoU',
+                   'Train Dice', 'Val Dice', 'Train Acc', 'Val Acc']
+        f.write("{:<8} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12} {:<12}\n".format(*headers))
+        f.write("-" * 100 + "\n")
+
+        n_epochs = len(history['train_loss'])
+        for i in range(n_epochs):
+            f.write("{:<8} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f} {:<12.4f}\n".format(
+                i + 1,
+                history['train_loss'][i],
+                history['val_loss'][i],
+                history['train_iou'][i],
+                history['val_iou'][i],
+                history['train_dice'][i],
+                history['val_dice'][i],
+                history['train_pixel_acc'][i],
+                history['val_pixel_acc'][i]
+            ))
+
+    print(f"Saved evaluation metrics to {filepath}")
+
+
+# ============================================================================
+# Main Training Function
+# ============================================================================
+
+def main():
+    # Configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Hyperparameters
+    batch_size = 4
+    img_size = 512
+    lr = 1e-4
+    n_epochs = 10
+    model_variant = "nvidia/segformer-b2-finetuned-ade-512-512"
+
+    # Output directory (relative to script location)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(script_dir, 'segformer_train_stats')
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Dataset paths (relative to script location)
+    data_dir = os.path.join(script_dir, '..', 'Offroad_Segmentation_Training_Dataset', 'Offroad_Segmentation_Training_Dataset', 'train')
+    val_dir = os.path.join(script_dir, '..', 'Offroad_Segmentation_Training_Dataset', 'Offroad_Segmentation_Training_Dataset', 'val')
+
+    # Create datasets
+    trainset = MaskDataset(data_dir=data_dir, img_size=img_size)
+    train_loader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+
+    valset = MaskDataset(data_dir=val_dir, img_size=img_size)
+    val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False)
+
+    print(f"Training samples: {len(trainset)}")
+    print(f"Validation samples: {len(valset)}")
+
+    # Load SegFormer-B3 model pretrained on ADE20K
+    print(f"Loading SegFormer model: {model_variant}...")
+    model = SegformerForSemanticSegmentation.from_pretrained(
+        model_variant,
+        num_labels=n_classes,
+        ignore_mismatched_sizes=True
+    )
+    model.to(device)
+    print("Model loaded successfully!")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    # Loss and optimizer
+    # loss_fct = nn.CrossEntropyLoss()
+    class_weights=torch.tensor([1,2,2,2,2,2,2,2,1,1]).float().to(device)
+    ce_loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+    loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # scheduler.step()  # Initialize scheduler
+
+    # Training history
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_iou': [],
+        'val_iou': [],
+        'train_dice': [],
+        'val_dice': [],
+        'train_pixel_acc': [],
+        'val_pixel_acc': []
+    }
+
+    best_val_iou = 0.0
+
+
+
+    # Training loop
+    print("\nStarting training...")
+    print("=" * 80)
+
+    epoch_pbar = tqdm(range(n_epochs), desc="Training", unit="epoch")
+    for epoch in epoch_pbar:
+        # Training phase
+        model.train()
+        train_losses = []
+
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]",
+                          leave=False, unit="batch")
+        for imgs, labels in train_pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
+
+            outputs = model(pixel_values=imgs)
+            logits = outputs.logits
+            upsampled = F.interpolate(logits, size=(img_size, img_size), mode="bilinear", align_corners=False)
+
+            loss = loss_fct(upsampled, labels)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            train_losses.append(loss.item())
+            train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        scheduler.step()
+
+        # Validation phase
+        model.eval()
+        val_losses = []
+
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Val]",
+                        leave=False, unit="batch")
+        with torch.no_grad():
+            for imgs, labels in val_pbar:
+                imgs, labels = imgs.to(device), labels.to(device)
+
+                outputs = model(pixel_values=imgs)
+                logits = outputs.logits
+                upsampled = F.interpolate(logits, size=(img_size, img_size), mode="bilinear", align_corners=False)
+
+                ce = loss_fct(upsampled, labels)
+                dice=dice_loss(upsampled, labels)
+                loss=0.6*ce+0.4*dice
+                val_losses.append(loss.item())
+                val_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        # Calculate metrics
+        train_iou, train_dice, train_pixel_acc = evaluate_metrics(
+            model, train_loader, device, img_size, num_classes=n_classes
+        )
+        val_iou, val_dice, val_pixel_acc = evaluate_metrics(
+            model, val_loader, device, img_size, num_classes=n_classes
+        )
+
+        # Store history
+        epoch_train_loss = np.mean(train_losses)
+        epoch_val_loss = np.mean(val_losses)
+
+        history['train_loss'].append(epoch_train_loss)
+        history['val_loss'].append(epoch_val_loss)
+        history['train_iou'].append(train_iou)
+        history['val_iou'].append(val_iou)
+        history['train_dice'].append(train_dice)
+        history['val_dice'].append(val_dice)
+        history['train_pixel_acc'].append(train_pixel_acc)
+        history['val_pixel_acc'].append(val_pixel_acc)
+
+        # Save best model
+        if val_iou > best_val_iou:
+            best_val_iou = val_iou
+            best_model_path = os.path.join(script_dir, "segformer_b3_best.pth")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"\n  New best model saved! Val IoU: {val_iou:.4f}")
+
+        # Update epoch progress bar with metrics
+        epoch_pbar.set_postfix(
+            train_loss=f"{epoch_train_loss:.3f}",
+            val_loss=f"{epoch_val_loss:.3f}",
+            val_iou=f"{val_iou:.3f}",
+            val_acc=f"{val_pixel_acc:.3f}",
+            lr=f"{scheduler.get_last_lr()[0]:.2e}"
+        )
+
+    # Save plots
+    print("\nSaving training curves...")
+    save_training_plots(history, output_dir)
+    save_history_to_file(history, output_dir)
+
+    # Save final model
+    final_model_path = os.path.join(script_dir, "segformer_b2_final.pth")
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Saved final model to '{final_model_path}'")
+    print(f"Best model saved to '{best_model_path}' (Val IoU: {best_val_iou:.4f})")
+
+    # Final evaluation
+    print("\nFinal evaluation results:")
+    print(f"  Final Val Loss:     {history['val_loss'][-1]:.4f}")
+    print(f"  Final Val IoU:      {history['val_iou'][-1]:.4f}")
+    print(f"  Final Val Dice:     {history['val_dice'][-1]:.4f}")
+    print(f"  Final Val Accuracy: {history['val_pixel_acc'][-1]:.4f}")
+    print(f"  Best Val IoU:       {best_val_iou:.4f}")
+
+    print("\nTraining complete!")
+
+
+if __name__ == "__main__":
+    main()
+
