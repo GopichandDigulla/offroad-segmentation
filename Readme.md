@@ -51,6 +51,7 @@ Result:
 | IoU | 0.50 | 0.48 |
 | Dice | - | - |
 | Accuracy | - | - |
+
 ---
 
 🔹 Run 2 — Improved Setup
@@ -74,7 +75,7 @@ Result:
 - Better stability
 - Improved IoU
 
----
+
 
 ## Train 2 – Improved
 
@@ -85,6 +86,7 @@ Result:
 | Dice | - | - |
 | Accuracy | - | - |
 
+---
 🔹 Run 3 — SegFormer-B3 (Final)
 
 Configuration:
@@ -99,7 +101,6 @@ Loss:
 
 - CrossEntropy + Dice Loss
 
----
 
 ## Train 3 – SegFormer
 
@@ -110,6 +111,7 @@ Loss:
 | Dice | 0.7582 | 0.7639 |
 | Accuracy | 0.8725 | 0.8729 |
 
+---
 📊 Final Results
 
 -Metric           | Value
@@ -131,7 +133,7 @@ Loss:
 - Best Val Accuracy: 0.8735
 - Lowest Val Loss: 0.4105
 
----
+
 ## Best Results
 
 | Metric | Value | Epoch |
@@ -140,6 +142,7 @@ Loss:
 | Best Val Dice | 0.7640 | 8 |
 | Best Val Accuracy | 0.8735 | 8 |
 | Lowest Val Loss | 0.4105 | 9 |
+---
 
 📈 Key Insights
 
